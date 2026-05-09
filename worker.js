@@ -1,35 +1,66 @@
-import { Telegraf } from 'telegraf';
-
-/**
- * Cloudflare Worker Handler
- * Cloudflare does not support long-polling (bot.launch()) in the standard way.
- * This is configured to work via Webhooks.
- */
+import { Telegraf, Markup } from 'telegraf';
 
 export default {
   async fetch(request, env) {
-    if (!env.TELEGRAM_BOT_TOKEN) {
-      return new Response('TELEGRAM_BOT_TOKEN is missing', { status: 500 });
-    }
-
+    const url = new URL(request.url);
     const bot = new Telegraf(env.TELEGRAM_BOT_TOKEN);
 
-    // Bot logic - ሰላም? /start ሲባል hello ብሎ ይመልሳል
-    bot.start((ctx) => ctx.reply('hello'));
-    
-    // ለሌሎች መልዕክቶች ምላሽ መስጠት ከፈለጉ እዚህ ይጨምሩ
-    bot.on('text', (ctx) => {
-      if (ctx.message.text.includes('ሰላም')) {
-        ctx.reply('ሰላም! እንዴት ነህ?');
+    // 1. Webhook Register Endpoint
+    if (url.pathname === '/register') {
+      try {
+        const webhookUrl = `${url.origin}/telegraf`;
+        await bot.telegram.setWebhook(webhookUrl);
+        return new Response(`Webhook registered at: ${webhookUrl}`, { status: 200 });
+      } catch (err) {
+        return new Response(`Error: ${err.message}`, { status: 500 });
       }
-    });
-
-    try {
-      // ይህ ለ Cloudflare environment ተብሎ የተሰራ ነው
-      return await bot.handleUpdate(await request.json());
-    } catch (err) {
-      console.error(err);
-      return new Response('Error processing update', { status: 500 });
     }
+
+    // 2. Webhook Handler
+    if (url.pathname === '/telegraf' && request.method === 'POST') {
+      try {
+        // --- Bot Logic ---
+        
+        // /start ሲባል የሚመጣ ምዝገባ
+        bot.start((ctx) => {
+          return ctx.reply(
+            `ሰላም ${ctx.from.first_name || 'ተማሪ'}! እንኳን ደህና መጡ።\n` +
+            `ለመመዝገብ እባክዎን መጀመሪያ "ስም" እና "ክፍል" በዚሁ ይላኩልኝ።\n` +
+            `(ለምሳሌ፡ አቤል በቀለ፣ 10B)`
+          );
+        });
+
+        // ተጠቃሚው መረጃ ሲልክ
+        bot.on('text', (ctx) => {
+          const msg = ctx.message.text;
+          if (msg.startsWith('/')) return;
+
+          return ctx.reply(
+            `ተቀብያለሁ! ያስገቡት መረጃ፡ "${msg}"\n\nአሁን ደግሞ ጾታዎን ይምረጡ፡`,
+            Markup.inlineKeyboard([
+              [Markup.button.callback('ወንድ', 'gender_male'), Markup.button.callback('ሴት', 'gender_female')]
+            ])
+          );
+        });
+
+        // የጾታ ምርጫ ሲነካ
+        bot.action(/gender_(.+)/, (ctx) => {
+          const gender = ctx.match[1] === 'male' ? 'ወንድ' : 'ሴት';
+          ctx.answerCbQuery();
+          return ctx.editMessageText(`ምዝገባው ተጠናቋል!\nጾታ፡ ${gender}\nእናመሰግናለን!`);
+        });
+
+        // -----------------
+
+        const update = await request.json();
+        await bot.handleUpdate(update);
+        return new Response('OK', { status: 200 });
+      } catch (err) {
+        console.error(err);
+        return new Response('Error', { status: 500 });
+      }
+    }
+
+    return new Response('Bot is active. Use /register to hook up.', { status: 200 });
   },
 };
