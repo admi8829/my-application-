@@ -30,7 +30,8 @@ export default {
           return ctx.reply(
             `ሰላም ${ctx.from.first_name || 'ተማሪ'}! እንኳን ደህና መጡ።\n\n` +
             `ለመመዝገብ እባክዎን ስምዎን እና ክፍልዎን ይላኩ።\n` +
-            `ለምሳሌ፡ "አቤል በቀለ፣ 10B"`
+            `ለምሳሌ፡ "አቤል በቀለ፣ 10B"`,
+            { protect_content: true }
           );
         });
 
@@ -41,12 +42,15 @@ export default {
 
           return ctx.reply(
             `ተቀብያለሁ! ያስገቡት መረጃ፡ "${text}"\n\nአሁን ደግሞ ጾታዎን ይምረጡ፡`,
-            Markup.inlineKeyboard([
-              [
-                Markup.button.callback('ወንድ', 'sex_male'),
-                Markup.button.callback('ሴት', 'sex_female')
-              ]
-            ])
+            {
+              protect_content: true,
+              ...Markup.inlineKeyboard([
+                [
+                  Markup.button.callback('ወንድ', 'sex_male'),
+                  Markup.button.callback('ሴት', 'sex_female')
+                ]
+              ])
+            }
           );
         });
 
