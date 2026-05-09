@@ -1,12 +1,35 @@
 import { Telegraf } from 'telegraf';
-import 'dotenv/config';
 
-const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
+/**
+ * Cloudflare Worker Handler
+ * Cloudflare does not support long-polling (bot.launch()) in the standard way.
+ * This is configured to work via Webhooks.
+ */
 
-bot.start((ctx) => ctx.reply('hello'));
+export default {
+  async fetch(request, env) {
+    if (!env.TELEGRAM_BOT_TOKEN) {
+      return new Response('TELEGRAM_BOT_TOKEN is missing', { status: 500 });
+    }
 
-bot.launch();
+    const bot = new Telegraf(env.TELEGRAM_BOT_TOKEN);
 
-// Enable graceful stop
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+    // Bot logic - ሰላም? /start ሲባል hello ብሎ ይመልሳል
+    bot.start((ctx) => ctx.reply('hello'));
+    
+    // ለሌሎች መልዕክቶች ምላሽ መስጠት ከፈለጉ እዚህ ይጨምሩ
+    bot.on('text', (ctx) => {
+      if (ctx.message.text.includes('ሰላም')) {
+        ctx.reply('ሰላም! እንዴት ነህ?');
+      }
+    });
+
+    try {
+      // ይህ ለ Cloudflare environment ተብሎ የተሰራ ነው
+      return await bot.handleUpdate(await request.json());
+    } catch (err) {
+      console.error(err);
+      return new Response('Error processing update', { status: 500 });
+    }
+  },
+};
