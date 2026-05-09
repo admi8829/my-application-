@@ -1,8 +1,8 @@
-name = "my-telegram-bot"
+name = "telegram-bot-worker"
 main = "worker.js"
-compatibility_date = "2024-04-03"
+compatibility_date = "2025-05-01"
 compatibility_flags = ["nodejs_compat"]
 
-[vars]
-# እዚህ ጋር ትናንሽ settings መጨመር ትችላለህ
-# ነገር ግን የቦት Token-ህን በ 'wrangler secret' መላክ ይሻላል
+# Note: Environment variables like TELEGRAM_BOT_TOKEN 
+# should be added via 'wrangler secret put TELEGRAM_BOT_TOKEN' 
+# or in the Cloudflare Dashboard.
