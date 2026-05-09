@@ -1,0 +1,17 @@
+{
+  "name": "telegram-bot-worker",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node worker.js",
+    "deploy": "wrangler deploy worker.js"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "telegraf": "^4.16.3"
+  },
+  "devDependencies": {
+    "tsx": "^4.21.0"
+  }
+}
