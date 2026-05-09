@@ -2,65 +2,77 @@ import { Telegraf, Markup } from 'telegraf';
 
 export default {
   async fetch(request, env) {
-    const url = new URL(request.url);
-    const bot = new Telegraf(env.TELEGRAM_BOT_TOKEN);
+    if (!env.TELEGRAM_BOT_TOKEN) {
+      return new Response('Error: TELEGRAM_BOT_TOKEN is not set in secrets.', { status: 500 });
+    }
 
-    // 1. Webhook Register Endpoint
+    const bot = new Telegraf(env.TELEGRAM_BOT_TOKEN);
+    const url = new URL(request.url);
+
+    // 1. Webhook Register Endpoint (ይህንን አንዴ በብሮውዘር በመክፈት ቦቱን ከCloudflare ጋር ያገናኙታል)
     if (url.pathname === '/register') {
       try {
-        const webhookUrl = `${url.origin}/telegraf`;
+        const webhookUrl = `${url.origin}/webhook`;
         await bot.telegram.setWebhook(webhookUrl);
-        return new Response(`Webhook registered at: ${webhookUrl}`, { status: 200 });
+        return new Response(`Webhook successfully registered at: ${webhookUrl}`, { status: 200 });
       } catch (err) {
-        return new Response(`Error: ${err.message}`, { status: 500 });
+        return new Response(`Registration Failed: ${err.message}`, { status: 500 });
       }
     }
 
-    // 2. Webhook Handler
-    if (url.pathname === '/telegraf' && request.method === 'POST') {
+    // 2. Webhook Handler (ከTelegram የሚመጡ መልዕክቶች እዚህ ይስተናገዳሉ)
+    if (url.pathname === '/webhook' && request.method === 'POST') {
       try {
-        // --- Bot Logic ---
-        
-        // /start ሲባል የሚመጣ ምዝገባ
+        // --- የምዝገባ ሎጂክ (Registration Flow) ---
+
+        // /start ሲባል
         bot.start((ctx) => {
           return ctx.reply(
-            `ሰላም ${ctx.from.first_name || 'ተማሪ'}! እንኳን ደህና መጡ።\n` +
-            `ለመመዝገብ እባክዎን መጀመሪያ "ስም" እና "ክፍል" በዚሁ ይላኩልኝ።\n` +
-            `(ለምሳሌ፡ አቤል በቀለ፣ 10B)`
+            `ሰላም ${ctx.from.first_name || 'ተማሪ'}! እንኳን ደህና መጡ።\n\n` +
+            `ለመመዝገብ እባክዎን ስምዎን እና ክፍልዎን ይላኩ።\n` +
+            `ለምሳሌ፡ "አቤል በቀለ፣ 10B"`
           );
         });
 
-        // ተጠቃሚው መረጃ ሲልክ
-        bot.on('text', (ctx) => {
-          const msg = ctx.message.text;
-          if (msg.startsWith('/')) return;
+        // መረጃ ሲላክ
+        bot.on('text', async (ctx) => {
+          const text = ctx.message.text;
+          if (text.startsWith('/')) return;
 
           return ctx.reply(
-            `ተቀብያለሁ! ያስገቡት መረጃ፡ "${msg}"\n\nአሁን ደግሞ ጾታዎን ይምረጡ፡`,
+            `ተቀብያለሁ! ያስገቡት መረጃ፡ "${text}"\n\nአሁን ደግሞ ጾታዎን ይምረጡ፡`,
             Markup.inlineKeyboard([
-              [Markup.button.callback('ወንድ', 'gender_male'), Markup.button.callback('ሴት', 'gender_female')]
+              [
+                Markup.button.callback('ወንድ', 'sex_male'),
+                Markup.button.callback('ሴት', 'sex_female')
+              ]
             ])
           );
         });
 
-        // የጾታ ምርጫ ሲነካ
-        bot.action(/gender_(.+)/, (ctx) => {
+        // ጾታ ሲመረጥ
+        bot.action(/sex_(.+)/, async (ctx) => {
           const gender = ctx.match[1] === 'male' ? 'ወንድ' : 'ሴት';
-          ctx.answerCbQuery();
-          return ctx.editMessageText(`ምዝገባው ተጠናቋል!\nጾታ፡ ${gender}\nእናመሰግናለን!`);
+          await ctx.answerCbQuery();
+          return ctx.editMessageText(
+            `✅ ምዝገባው ተጠናቋል!\n\n` +
+            `ጾታ፡ ${gender}\n` +
+            `ስለተመዘገቡ እናመሰግናለን!`
+          );
         });
 
-        // -----------------
+        // ------------------------------------
 
         const update = await request.json();
         await bot.handleUpdate(update);
         return new Response('OK', { status: 200 });
       } catch (err) {
-        console.error(err);
-        return new Response('Error', { status: 500 });
+        console.error('Update Error:', err);
+        return new Response('OK', { status: 200 }); // Telegram tries again if not 200
       }
     }
 
-    return new Response('Bot is active. Use /register to hook up.', { status: 200 });
+    // Dashboard ገጽ (ለማረጋገጫ ብቻ)
+    return new Response('Telegram Bot Worker is Live. Path: /webhook', { status: 200 });
   },
 };

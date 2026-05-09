@@ -1,4 +1,4 @@
-name = "telegram-bot-worker"
+name = "student-registration-bot"
 main = "worker.js"
 compatibility_date = "2025-05-01"
 compatibility_flags = ["nodejs_compat"]
