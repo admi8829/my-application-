@@ -29,7 +29,7 @@ export default {
         bot.start((ctx) => {
           return ctx.reply(
             `ሰላም ${ctx.from.first_name || 'ተማሪ'}! 👋 ወደ እውቀት የትምህርት ረዳት ቦት እንኳን ደህና መጡ።\n\n` +
-            `እባክዎን ከታች ካሉት አማራጮች የሚፈልጉትን ይምረጡ፡`,
+            `እባክዎን ከታች ካሉት አማራጮች የሚፈልጉትን ይምረ፡`,
             {
               protect_content: true,
               ...Markup.keyboard([
