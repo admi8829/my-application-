@@ -1,8 +1,8 @@
-name = "my-application"
+name = "student-registration-bot"
 main = "worker.js"
 compatibility_date = "2025-05-01"
 compatibility_flags = ["nodejs_compat"]
 
-# Note: Environment variables like TELEGRAM_BOT_TOKEN 
+# Note: Environment variables like TELEGRAM_BOT_TOKEN and GEMINI_API_KEY
 # should be added via 'wrangler secret put TELEGRAM_BOT_TOKEN' 
 # or in the Cloudflare Dashboard.

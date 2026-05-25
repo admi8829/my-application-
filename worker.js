@@ -29,12 +29,13 @@ export default {
         bot.start((ctx) => {
           return ctx.reply(
             `ሰላም ${ctx.from.first_name || 'ተማሪ'}! 👋 ወደ እውቀት የትምህርት ረዳት ቦት እንኳን ደህና መጡ።\n\n` +
-            `እባክዎን ከታች ካሉት አማራጮች የሚፈልጉትን ይምረ፡`,
+            `እባክዎን ከታች ካሉት አማራጮች የሚፈልጉትን ይምረጡ፡`,
             {
               protect_content: true,
               ...Markup.keyboard([
                 ['📝 መመዝገቢያ', '📚 የክፍል ትምህርቶች'],
-                ['❓ የእለቱ ጥያቄ', 'ℹ️ መረጃ & እገዛ']
+                ['❓ የእለቱ ጥያቄ', 'ℹ️ መረጃ & እገዛ'],
+                ['🤖 የ AI ረዳት']
               ]).resize()
             }
           );
@@ -93,6 +94,71 @@ export default {
               ])
             }
           );
+        });
+
+        // 🤖 የ AI ረዳት ምርጫ
+        bot.hears('🤖 የ AI ረዳት', (ctx) => {
+          return ctx.reply(
+            `🤖 *የ AI ረዳት (AI Assistant)*\n\n` +
+            `ማንኛውንም ጥያቄ ለመጠየቅ ከፊት ለፊቱ "AI" ብለው ጽፈው ይላኩልኝ።\n` +
+            `ለምሳሌ፡ "AI የፀሐይ ብርሃን ጥቅሞች ምንድን ናቸው?"\n\n` +
+            `ወይም "AI 5 * 8 ስንት ነው?"`,
+            {
+              parse_mode: 'Markdown',
+              protect_content: true
+            }
+          );
+        });
+
+        // የ AI ጥያቄ ሲላክ
+        bot.hears(/^AI\s+(.+)$/i, async (ctx) => {
+          const question = ctx.match[1];
+          await ctx.reply('⏳ ከ Google Search መረጃ እየፈለግኩ ነው...', { protect_content: true });
+          
+          try {
+            const { GoogleGenAI } = await import('@google/genai');
+            if (!env.GEMINI_API_KEY) {
+              return ctx.reply('⚠️ ይቅርታ፣ የ AI ረዳት በአሁን ሰዓት አይሰራም (GEMINI_API_KEY አልገባም)።');
+            }
+
+            const ai = new GoogleGenAI({ 
+              apiKey: env.GEMINI_API_KEY,
+              httpOptions: { headers: { 'User-Agent': 'aistudio-build' } }
+            });
+            const response = await ai.models.generateContent({
+              model: 'gemini-3.5-flash',
+              contents: question,
+              config: {
+                tools: [{ googleSearch: {} }],
+                systemInstruction: 'You are a helpful educational AI assistant for students in Ethiopia. Always perform Google Search grounding to retrieve real-time, accurate facts. Summarize the facts clearly in Amharic. Be highly accurate, concise, and polite.',
+              }
+            });
+            
+            let replyText = `🤖 *የ AI መልስ:*\n\n${response.text}`;
+
+            // ከ Google Search የተገኙ ምንጮችን ማውጣት እና ማሳየት
+            const chunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks;
+            if (chunks && chunks.length > 0) {
+              const sourceUrls = [];
+              for (const chunk of chunks) {
+                if (chunk.web?.uri) {
+                  const title = chunk.web.title || 'ዌብሳይት';
+                  // በሊንክ መልክ ማስቀመጥ (Telegram Markdown ፎርማት)
+                  sourceUrls.push(`• [${title}](${chunk.web.uri})`);
+                }
+              }
+              if (sourceUrls.length > 0) {
+                // እስከ 3 ዋና ዋና ምንጮችን ብቻ ያሳያል
+                const uniqueSources = Array.from(new Set(sourceUrls)).slice(0, 3);
+                replyText += `\n\n🌐 *ዋና ዋና የ Google መረጃ ምንጮች:*\n${uniqueSources.join('\n')}`;
+              }
+            }
+
+            return ctx.reply(replyText, { parse_mode: 'Markdown', protect_content: true });
+          } catch (error) {
+            console.error('Gemini Error:', error);
+            return ctx.reply('❌ ይቅርታ፣ አሁን ላይ ጥያቄዎን መመለስ አልቻልኩም። እባክዎ ቆየት ብለው ይሞክሩ።', { protect_content: true });
+          }
         });
 
         // ℹ️ መረጃ & እገዛ ምርጫ
