@@ -1,4 +1,4 @@
-name = "student-registration-bot"
+name = "my-application"
 main = "worker.js"
 compatibility_date = "2025-05-01"
 compatibility_flags = ["nodejs_compat"]
