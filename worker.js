@@ -1,5 +1,10 @@
 import { Telegraf, Markup } from 'telegraf';
 
+// Global state in-memory (persists within the active Cloudflare isolation instance)
+const registrations = [];
+const userStates = {};
+const admins = new Set();
+
 export default {
   async fetch(request, env) {
     if (!env.TELEGRAM_BOT_TOKEN) {
@@ -25,6 +30,29 @@ export default {
       try {
         // --- Bot Logic ---
 
+        // Helper to show the Admin Panel
+        const showAdminPanel = (ctx) => {
+          return ctx.reply(
+            `🔑 *የአስተዳዳሪ መቆጣጠሪያ ሰሌዳ (Admin Panel)*\n\n` +
+            `ያለዎት ፈቃድ፡ *አስተዳዳሪ (Administrator)*\n\n` +
+            `አብረውት የሚሰሩትን ተግባራት ከታች ካሉት አማራጮች ይምረጡ፡`,
+            {
+              parse_mode: 'Markdown',
+              protect_content: true,
+              ...Markup.inlineKeyboard([
+                [
+                  Markup.button.callback('👥 የተመዘገቡ ተማሪዎች', 'admin_view_students'),
+                  Markup.button.callback('📢 የጋራ መልዕክት', 'admin_broadcast_init')
+                ],
+                [
+                  Markup.button.callback('📊 የቦት ሁኔታ', 'admin_view_stats'),
+                  Markup.button.callback('🔓 ውጣ (Log Out)', 'admin_logout')
+                ]
+              ])
+            }
+          );
+        };
+
         // /start ወይም መጀመሪያ ሲመጡ
         bot.start((ctx) => {
           return ctx.reply(
@@ -35,7 +63,7 @@ export default {
               ...Markup.keyboard([
                 ['📝 መመዝገቢያ', '📚 የክፍል ትምህርቶች'],
                 ['❓ የእለቱ ጥያቄ', 'ℹ️ መረጃ & እገዛ'],
-                ['🤖 የ AI ረዳት']
+                ['🤖 የ AI ረዳት', '🔑 የአስተዳዳሪ ክፍል']
               ]).resize()
             }
           );
@@ -43,6 +71,8 @@ export default {
 
         // 📝 መመዝገቢያ ምርጫ
         bot.hears('📝 መመዝገቢያ', (ctx) => {
+          const userId = ctx.from.id;
+          userStates[userId] = { step: 'awaiting_name_grade' };
           return ctx.reply(
             `📝 *የተማሪ ምዝገባ*\n\n` +
             `እባክዎን ስምዎን እና ክፍልዎን ይላኩ።\n` +
@@ -299,25 +329,223 @@ export default {
           );
         });
 
-        // ማንኛውም ተራ ጽሑፍ ሲላክ (ለምሳሌ ስምና ክፍል ለምዝገባ)
+        // --- 🔑 የአስተዳዳሪ ክፍሎች (Admin Listeners) ---
+
+        bot.hears('🔑 የአስተዳዳሪ ክፍል', async (ctx) => {
+          const userId = ctx.from.id;
+          const isDirectAdmin = env.ADMIN_TELEGRAM_ID && String(userId) === String(env.ADMIN_TELEGRAM_ID);
+          const isSessionAdmin = admins.has(userId);
+
+          if (isDirectAdmin || isSessionAdmin) {
+            return showAdminPanel(ctx);
+          } else {
+            userStates[userId] = { step: 'awaiting_admin_password' };
+            return ctx.reply(
+              `🔑 *የአስተዳዳሪ መግቢያ*\n\n` +
+              `ወደ ሚስጥራዊው አስተዳዳሪ ክፍል ለመግባት እባክዎ የይለፍ ቃል (Password) ይጻፉ፡`,
+              { parse_mode: 'Markdown', protect_content: true }
+            );
+          }
+        });
+
+        bot.command('admin', async (ctx) => {
+          const userId = ctx.from.id;
+          const isDirectAdmin = env.ADMIN_TELEGRAM_ID && String(userId) === String(env.ADMIN_TELEGRAM_ID);
+          const isSessionAdmin = admins.has(userId);
+
+          if (isDirectAdmin || isSessionAdmin) {
+            return showAdminPanel(ctx);
+          } else {
+            userStates[userId] = { step: 'awaiting_admin_password' };
+            return ctx.reply(
+              `🔑 *የአስተዳዳሪ መግቢያ*\n\n` +
+              `ወደ ሚስጥራዊው አስተዳዳሪ ክፍል ለመግባት እባክዎ የይለፍ ቃል (Password) ይጻፉ፡`,
+              { parse_mode: 'Markdown', protect_content: true }
+            );
+          }
+        });
+
+        // የአስተዳዳሪ Callback Actions
+        bot.action('admin_view_students', async (ctx) => {
+          await ctx.answerCbQuery();
+          const userId = ctx.from.id;
+          const isAuthorized = admins.has(userId) || String(userId) === String(env.ADMIN_TELEGRAM_ID);
+          if (!isAuthorized) return ctx.reply('❌ ፈቃድ የለዎትም!');
+
+          if (registrations.length === 0) {
+            return ctx.reply(
+              `👥 *የተመዘገቡ ተማሪዎች ዝርዝር*\n\n` +
+              `በአሁን ሰዓት ምንም የተመዘገበ ተማሪ የለም! 📭\n` +
+              `_(ማሳሰቢያ: ተማሪዎች ሲመዘገቡ እዚህ ይታያሉ)_`,
+              {
+                parse_mode: 'Markdown',
+                protect_content: true,
+                ...Markup.inlineKeyboard([[Markup.button.callback('↩️ ወደ መቆጣጠሪያ ሰሌዳ', 'admin_go_back')]])
+              }
+            );
+          }
+
+          let studentListText = `👥 *የተመዘገቡ ተማሪዎች ዝርዝር (${registrations.length})*\n\n`;
+          registrations.forEach((student, index) => {
+            const username = student.username ? `@${student.username}` : 'ያልተገባ';
+            studentListText += `${index + 1}. *${student.first_name || 'ተማሪ'}* (${username})\n` +
+                               `   • መረጃ፡ \`${student.info}\`\n` +
+                               `   • ጾታ፡ ${student.gender}\n` +
+                               `   • ይመዘገብበት ሰዓት፡ ${student.date}\n\n`;
+          });
+
+          return ctx.reply(
+            studentListText,
+            {
+              parse_mode: 'Markdown',
+              protect_content: true,
+              ...Markup.inlineKeyboard([[Markup.button.callback('↩️ ወደ መቆጣጠሪያ ሰሌዳ', 'admin_go_back')]])
+            }
+          );
+        });
+
+        bot.action('admin_broadcast_init', async (ctx) => {
+          await ctx.answerCbQuery();
+          const userId = ctx.from.id;
+          const isAuthorized = admins.has(userId) || String(userId) === String(env.ADMIN_TELEGRAM_ID);
+          if (!isAuthorized) return ctx.reply('❌ ፈቃድ የለዎትም!');
+
+          userStates[userId] = { step: 'awaiting_broadcast' };
+          return ctx.reply(
+            `📢 *የጋራ መልዕክት መላኪያ (Broadcast)*\n\n` +
+            `እባክዎን ለሁሉም ተማሪዎች ማስተላለፍ የሚፈልጉትን መልዕክት እዚህ ይጻፉልኝ።\n` +
+            `መልዕክቱ እያንዳንዱ ተማሪ ጋር ይደርሳል።`,
+            { parse_mode: 'Markdown', protect_content: true }
+          );
+        });
+
+        bot.action('admin_view_stats', async (ctx) => {
+          await ctx.answerCbQuery();
+          const userId = ctx.from.id;
+          const isAuthorized = admins.has(userId) || String(userId) === String(env.ADMIN_TELEGRAM_ID);
+          if (!isAuthorized) return ctx.reply('❌ ፈቃድ የለዎትም!');
+
+          const tokenStatus = env.TELEGRAM_BOT_TOKEN ? '✅ Active' : '❌ Inactive';
+          const geminiStatus = env.GEMINI_API_KEY ? '✅ Active' : '❌ Inactive';
+
+          return ctx.reply(
+            `📊 *የቦቱ አጠቃላይ ሁኔታ (Bot Live System Status)*\n\n` +
+            `• *የተመዘገቡ ተማሪዎች:* \`${registrations.length}\` ተማሪዎች\n` +
+            `• *Telegram Token:* ${tokenStatus}\n` +
+            `• *Google Gemini API:* ${geminiStatus}\n` +
+            `• *የመትከያ መድረክ (Engine):* Cloudflare Workers\n` +
+            `• *የደህንነት ሁኔታ:* Screenshot & Forward Protected 🔥\n\n` +
+            `💡 _እነዚህ መረጃዎች በየሰከንዱ የሚደሱ የቀጥታ ሁኔታ ማሳያዎች ናቸው።_`,
+            {
+              parse_mode: 'Markdown',
+              protect_content: true,
+              ...Markup.inlineKeyboard([[Markup.button.callback('↩️ ወደ መቆጣጠሪያ ሰሌዳ', 'admin_go_back')]])
+            }
+          );
+        });
+
+        bot.action('admin_logout', async (ctx) => {
+          await ctx.answerCbQuery('ለቀው ወጥተዋል!');
+          admins.delete(ctx.from.id);
+          return ctx.editMessageText('✅ ከአስተዳዳሪው መቆጣጠሪያ ሰሌዳ ወጥተዋል። ደህንነትዎ የተጠበቀ ነው!');
+        });
+
+        bot.action('admin_go_back', async (ctx) => {
+          await ctx.answerCbQuery();
+          try {
+            await ctx.deleteMessage();
+          } catch(e) {}
+          return showAdminPanel(ctx);
+        });
+
+        // --- ✍️ የጽሑፍ እና መመዝገቢያ ማስተናገጃ (Main Message Handler) ---
+
         bot.on('text', async (ctx) => {
           const text = ctx.message.text;
           if (text.startsWith('/')) return;
 
-          return ctx.reply(
-            `✍️ *ተቀብያለሁ!*\n\n` +
-            `ያስተላለፉት መረጃ፡ "${text}"\n\n` +
-            `አሁን ደግሞ እባክዎን ጾታዎን ከታች ይምረጡ፡`,
-            {
-              protect_content: true,
-              parse_mode: 'Markdown',
-              ...Markup.inlineKeyboard([
-                [
-                  Markup.button.callback('👨 ወንድ (Male)', 'sex_male'),
-                  Markup.button.callback('👩 ሴት (Female)', 'sex_female')
-                ]
-              ])
+          const userId = ctx.from.id;
+          const state = userStates[userId];
+
+          // 1. መመዝገቢያ ሎጂክ
+          if (state && state.step === 'awaiting_name_grade') {
+            userStates[userId] = { step: 'awaiting_gender', info: text };
+            return ctx.reply(
+              `✍️ *ተቀብያለሁ!*\n\n` +
+              `ያስተላለፉት መረጃ፡ "${text}"\n\n` +
+              `አሁን ደግሞ እባክዎን ጾታዎን ከታች ይምረጡ፡`,
+              {
+                protect_content: true,
+                parse_mode: 'Markdown',
+                ...Markup.inlineKeyboard([
+                  [
+                    Markup.button.callback('👨 ወንድ (Male)', 'sex_male'),
+                    Markup.button.callback('👩 ሴት (Female)', 'sex_female')
+                  ]
+                ])
+              }
+            );
+          }
+
+          // 2. የአስተዳዳሪ የይለፍ ቃል ማስገቢያ ሎጂክ (Awaiting Password)
+          if (state && state.step === 'awaiting_admin_password') {
+            const adminPass = env.ADMIN_PASSWORD || 'admin123';
+            if (text === adminPass) {
+              admins.add(userId);
+              delete userStates[userId];
+              return showAdminPanel(ctx);
+            } else {
+              delete userStates[userId];
+              return ctx.reply('❌ የተሳሳተ የይለፍ ቃል! የአስተዳዳሪው ክፍል ተቆልፏል።');
             }
+          }
+
+          // 3. የአስተዳዳሪ የጋራ መልዕክት ሎጂክ (Awaiting Broadcast Message)
+          if (state && state.step === 'awaiting_broadcast') {
+            const isAuthorized = admins.has(userId) || String(userId) === String(env.ADMIN_TELEGRAM_ID);
+            if (!isAuthorized) {
+              delete userStates[userId];
+              return ctx.reply('❌ መብት የለዎትም!');
+            }
+
+            delete userStates[userId];
+            const broadcastMsg = text;
+            await ctx.reply('⏳ መልዕክቱ ለሁሉም ተማሪዎች በመላክ ላይ ነው...', { protect_content: true });
+
+            // ከተመዘገቡት ተማሪዎች ልዩ የሆኑ Chat IDዎችን ወስደን ማስተላለፍ
+            const targetIds = Array.from(new Set(registrations.map(r => r.id)));
+            // መላኪያው እንዲሞከር በራሱ ለአስተዳዳሪውም መላክ
+            if (!targetIds.includes(userId)) targetIds.push(userId);
+
+            let successCount = 0;
+            let failCount = 0;
+
+            for (const targetId of targetIds) {
+              try {
+                await ctx.telegram.sendMessage(targetId, 
+                  `📢 *ከአስተዳዳሪው የተላለፈ የጋራ መልዕክት*\n\n${broadcastMsg}`, 
+                  { parse_mode: 'Markdown', protect_content: true }
+                );
+                successCount++;
+              } catch (err) {
+                console.error(`Failed to send to ${targetId}:`, err);
+                failCount++;
+              }
+            }
+
+            return ctx.reply(
+              `✅ *የጋራ መልዕክት ማስተላለፉ ተጠናቋል!*\n\n` +
+              `• በተሳካ ሁኔታ የተላከላቸው፡ *${successCount}*\n` +
+              `• ያልተላከላቸው (ያገዱ ወይም ስህተት)፡ *${failCount}*`,
+              { parse_mode: 'Markdown' }
+            );
+          }
+
+          // ማንኛውም ሌላ ጥያቄ ሲመጣ ጥቆማ መስጠት
+          return ctx.reply(
+            `❓ ማስገባት የፈለጉትን መረጃ መለየት አልቻልኩም።\n\n` +
+            `• ለመመዝገብ ከታች '📝 መመዝገቢያ' የሚለውን ይጫኑ።\n` +
+            `• ጥያቄ ለመጠየቅ 'AI' ብለው መልዕክት ይጀምሩ (ለምሳሌ: AI ጤና ምንድን ነው?)`
           );
         });
 
@@ -325,8 +553,27 @@ export default {
         bot.action(/sex_(.+)/, async (ctx) => {
           const gender = ctx.match[1] === 'male' ? 'ወንድ' : 'ሴት';
           await ctx.answerCbQuery();
+          
+          const userId = ctx.from.id;
+          const info = userStates[userId]?.info || 'ያልታወቀ ተማሪ';
+
+          // አስቀምጥ
+          registrations.push({
+            id: userId,
+            first_name: ctx.from.first_name || '',
+            username: ctx.from.username || '',
+            info: info,
+            gender: gender,
+            date: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })
+          });
+
+          // state አጽዳ
+          delete userStates[userId];
+
           return ctx.editMessageText(
             `✅ *ምዝገባው በተሳካ ሁኔታ ተጠናቋል!*\n\n` +
+            `📝 *የተማሪ መረጃ:*\n` +
+            `• ስምና ክፍል፡ *${info}*\n` +
             `• ጾታ፡ *${gender}*\n\n` +
             `ትምህርቶችን ለመጀመር ከስር ባለው ኪቦርድ '📚 የክፍል ትምህርቶች' የሚለውን ይጫኑ። 🚀`,
             { parse_mode: 'Markdown' }
