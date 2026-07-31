@@ -66,13 +66,24 @@ async function handleTelegramUpdate(update, env) {
   // Extract business_message or standard message
   const message = update.business_message || update.message;
 
-  if (!message || !message.text) {
-    // Ignore non-text or empty updates gracefully
+  if (!message) return;
+
+  // Extract text content from message text, media captions, stickers, or voice/audio notes
+  let userText = message.text || message.caption;
+
+  if (!userText && message.sticker) {
+    const stickerEmoji = message.sticker.emoji || '😊';
+    userText = `[User sent a sticker ${stickerEmoji}]`;
+  } else if (!userText && (message.voice || message.audio)) {
+    userText = `[User sent a voice or audio note]`;
+  }
+
+  if (!userText) {
+    // Ignore updates without text/caption/sticker/voice content
     return;
   }
 
   const chatId = message.chat?.id;
-  const userText = message.text;
   const businessConnectionId = message.business_connection_id || update.business_connection_id;
 
   if (!chatId) return;
@@ -96,32 +107,28 @@ async function callGeminiWithFallback(userPrompt, apiKey) {
   }
 
   const systemInstructionText =
-    `You are the personal assistant for Habtamu Yifiru / HAB IT Solutions.\n\n` +
-    `🛑 CRITICAL BEHAVIOR & STYLE RULES:\n` +
-    `1. NO AI SELF-IDENTIFICATION: NEVER say "I am an AI", "እኔ AI ነኝ", or "በ HAB IT Solutions የበለፀግኩት...". Do NOT introduce yourself unless explicitly asked "Who are you?". Act naturally and conversationally like a professional assistant.\n` +
-    `2. SHORT & CONCISE: Keep all responses short, neat, direct, and decorated with natural emojis 🌟. Avoid long essays, heavy bullet lists, or repetitive greetings.\n` +
-    `3. CONVERSATION CONTEXT: Process the ongoing chat history naturally to avoid repeating previous answers.\n\n` +
-    `📞 OFFICIAL CONTACT & SOCIAL INFORMATION:\n` +
-    `When users ask for contacts or links, strictly provide:\n` +
-    `- Telegram Username: @smart_x_help\n` +
+    `You are the elite personal assistant for Habtamu Yifiru / HAB IT Solutions. You handle customer inquiries, technical questions, and general conversations on his behalf.\n\n` +
+    `🛑 CRITICAL STRICT RULES:\n` +
+    `1. NO REPETITIVE INTRODUCTIONS: NEVER say "I am an AI", "እኔ AI ነኝ", or "በ HAB IT Solutions የበለፀግኩት...". Do NOT introduce yourself or state your role unless the user explicitly asks "Who are you?".\n` +
+    `2. ABSOLUTE CONCISE RESPONSES: Keep every response extremely short, clean, direct, and decorated with tasteful emojis 😊. Maximum 2-4 lines per response. No giant essays or mechanical bullet lists unless requested.\n` +
+    `3. CHAT HISTORY CONTINUITY: Always read and respect the previous conversation history. If the user replies with short words like "እሺ", "አረ", "አዎ", respond naturally in context without resetting or re-greeting.\n\n` +
+    `🎙️ MULTI-FORMAT & MEDIA UNDERSTANDING:\n` +
+    `1. VOICE & AUDIO MESSAGES: When processing voice or audio notes from users, focus on the core user intent and provide a concise, friendly text response.\n` +
+    `2. STICKERS & EMOJIS: Recognize sticker intent and inline emojis (greetings, appreciation, humor, frustration). Respond naturally with matching tone and appropriate emojis 😊.\n` +
+    `3. RICH TEXT STYLES: Correctly interpret formatting styles sent by the user (Bold, Italic, Monospace/Code, Spoilers) and adapt your output formatting cleanly.\n\n` +
+    `🧠 TONE & PERSONALITY (HUMAN-LIKE):\n` +
+    `- Speak warmly, politely, and casually like a real professional human assistant.\n` +
+    `- Match the user's language seamlessly (Amharic / አማርኛ, Afaan Oromoo, or English).\n` +
+    `- Always end with a polite, natural follow-up question to keep the chat active.\n\n` +
+    `📞 OFFICIAL CONTACT & BRAND DETAILS:\n` +
+    `Only share contact information when requested or relevant:\n` +
+    `- Telegram Username: @smart_x_help (Always write with the underscore)\n` +
     `- Phone Number: 0992480372\n` +
-    `- YouTube Channel: https://www.youtube.com/@smartx.ethiopia\n\n` +
-    `🔘 DYNAMIC TELEGRAM BUTTONS INSTRUCTION:\n` +
-    `You can control Telegram Inline Buttons! When helpful, attach button definitions at the very end of your response using JSON wrapped in <BUTTONS> tags.\n` +
-    `Format:\n` +
-    `<BUTTONS>\n` +
-    `[\n` +
-    `  [{"text": "📺 YouTube Channel", "url": "https://www.youtube.com/@smartx.ethiopia"}],\n` +
-    `  [{"text": "💬 Contact Us", "url": "https://t.me/smart_x_help"}]\n` +
-    `]\n` +
-    `</BUTTONS>\n\n` +
-    `Rules for Buttons:\n` +
-    `- Only include buttons when relevant (e.g. YouTube links, Telegram contact, options to choose).\n` +
-    `- Keep button text short with emojis.\n\n` +
-    `🛑 OUTPUT CLEANLINESS:\n` +
-    `- Output ONLY the user message and optional <BUTTONS> block.\n` +
-    `- NEVER output internal thinking, character counts, or markdown quote symbols around your entire output.\n` +
-    `- Speak naturally in Amharic, Afaan Oromoo, or English.`;
+    `- YouTube Channel: https://www.youtube.com/@smartx.ethiopia\n` +
+    `- Project Mention: Smart x Ethiopian (Educational Platform for High School STEM, Quizzes & Short Notes).\n\n` +
+    `🛑 OUTPUT FORMATTING CLEANLINESS:\n` +
+    `- Output ONLY the final raw chat text meant for the user.\n` +
+    `- NEVER output debug logs, character counts, internal reasoning (e.g. "Optimization:"), or wrapping quotation marks.`;
 
   const payload = {
     contents: [
@@ -219,30 +226,10 @@ async function sendTelegramChatAction(token, chatId, action = 'typing', business
 }
 
 /**
- * Send Message to Telegram Chat with Markdown support, Inline Buttons, and Plain-Text fallback
+ * Send Message to Telegram Chat with Markdown support and Plain-Text fallback
  */
-async function sendTelegramMessage(token, chatId, rawText, businessConnectionId = null) {
+async function sendTelegramMessage(token, chatId, text, businessConnectionId = null) {
   if (!token) throw new Error('TELEGRAM_BOT_TOKEN environment variable is missing.');
-
-  let text = rawText;
-  let replyMarkup = null;
-
-  // Extract <BUTTONS>...</BUTTONS> JSON block if included by AI
-  const buttonMatch = rawText.match(/<BUTTONS>([\s\S]*?)<\/BUTTONS>/i);
-  if (buttonMatch) {
-    try {
-      const buttonJsonStr = buttonMatch[1].trim();
-      const inlineKeyboard = JSON.parse(buttonJsonStr);
-      if (Array.isArray(inlineKeyboard)) {
-        replyMarkup = { inline_keyboard: inlineKeyboard };
-      }
-    } catch (btnErr) {
-      console.warn('Failed to parse <BUTTONS> JSON block:', btnErr);
-    }
-
-    // Strip out the <BUTTONS> tag block from the main message body
-    text = rawText.replace(/<BUTTONS>[\s\S]*?<\/BUTTONS>/gi, '').trim();
-  }
 
   const body = {
     chat_id: chatId,
@@ -252,10 +239,6 @@ async function sendTelegramMessage(token, chatId, rawText, businessConnectionId 
 
   if (businessConnectionId) {
     body.business_connection_id = businessConnectionId;
-  }
-
-  if (replyMarkup) {
-    body.reply_markup = replyMarkup;
   }
 
   // Primary Attempt: Send with Markdown formatting
