@@ -1,7 +1,8 @@
 /**
- * Cloudflare Worker: Telegram Business Auto-Responder Bot with Gemini API & Multi-Model Fallback
+ * Cloudflare Worker: Telegram Business Auto-Responder Bot with Gemini API,
+ * Multi-Model Fallback, Vision/Audio Multimodal Support & Chat History Continuity.
  *
- * Principal: Habtamu Yifiru (@smart_x_help / Habtamu Yifiru Official - Smart x Ethiopian)
+ * Principal: Habtamu Yifiru / HAB IT Solutions (@smart_x_help)
  * Target Platform: Cloudflare Workers (ES Modules format)
  *
  * Environment Variables / Secrets Required in Cloudflare Worker Dashboard:
@@ -17,6 +18,10 @@ const GEMINI_MODELS = [
   'gemini-3.5-flash-lite',
   'gemini-3-flash'
 ];
+
+// In-memory sliding window cache for recent conversation history per chat_id
+const CHAT_HISTORIES = new Map();
+const MAX_HISTORY_TURNS = 10; // Keep up to last 10 turns (5 user + 5 model)
 
 export default {
   async fetch(request, env, ctx) {
@@ -44,11 +49,12 @@ export default {
 
     // 3. Status & Health Landing Page
     return new Response(
-      `🤖 Telegram Business Auto-Responder Worker (Gemini Multi-Model Fallback)\n\n` +
+      `🤖 Telegram Business Auto-Responder Worker (Gemini Multi-Model Multimodal)\n\n` +
       `Status: Live & Operational\n` +
-      `Assistant Partner for: Habtamu Yifiru (@smart_x_help / Smart X Ethiopian)\n` +
+      `Assistant Partner for: Habtamu Yifiru (@smart_x_help / HAB IT Solutions)\n` +
       `Platform: Cloudflare Workers\n\n` +
       `• Active Models: ${GEMINI_MODELS.join(', ')}\n` +
+      `• Capabilities: Chat History Memory, Voice/Audio, Image Vision, Multi-Model Fallback\n` +
       `• Webhook Receiver Endpoint: POST ${url.origin}/\n` +
       `• Register Webhook Endpoint: GET ${url.origin}/register`,
       {
@@ -63,45 +69,128 @@ export default {
  * Main Handler for Telegram Updates (business_message or standard message)
  */
 async function handleTelegramUpdate(update, env) {
-  // Extract business_message or standard message
   const message = update.business_message || update.message;
-
   if (!message) return;
-
-  // Extract text content from message text, media captions, stickers, or voice/audio notes
-  let userText = message.text || message.caption;
-
-  if (!userText && message.sticker) {
-    const stickerEmoji = message.sticker.emoji || '😊';
-    userText = `[User sent a sticker ${stickerEmoji}]`;
-  } else if (!userText && (message.voice || message.audio)) {
-    userText = `[User sent a voice or audio note]`;
-  }
-
-  if (!userText) {
-    // Ignore updates without text/caption/sticker/voice content
-    return;
-  }
 
   const chatId = message.chat?.id;
   const businessConnectionId = message.business_connection_id || update.business_connection_id;
-
   if (!chatId) return;
+
+  const userParts = [];
+  let userCaption = message.text || message.caption || '';
 
   // Step 1: Send typing status indicator to Telegram
   await sendTelegramChatAction(env.TELEGRAM_BOT_TOKEN, chatId, 'typing', businessConnectionId);
 
-  // Step 2: Call Gemini API with Multi-Model Fallback & Auto-Retry
-  const aiResponse = await callGeminiWithFallback(userText, env.GEMINI_API_KEY);
+  // Step 2: Handle incoming Images/Photos (Vision)
+  if (message.photo && message.photo.length > 0) {
+    const largestPhoto = message.photo[message.photo.length - 1];
+    const imageBase64 = await getTelegramFileBase64(env.TELEGRAM_BOT_TOKEN, largestPhoto.file_id);
+    if (imageBase64) {
+      userParts.push({
+        inlineData: {
+          mimeType: 'image/jpeg',
+          data: imageBase64
+        }
+      });
+    }
+  }
 
-  // Step 3: Send AI reply back to user with Markdown formatting (and plain-text fallback)
+  // Step 3: Handle incoming Voice / Audio notes
+  if (message.voice || message.audio) {
+    const audioObj = message.voice || message.audio;
+    const mimeType = message.voice ? 'audio/ogg' : (audioObj.mime_type || 'audio/mpeg');
+    const audioBase64 = await getTelegramFileBase64(env.TELEGRAM_BOT_TOKEN, audioObj.file_id);
+    if (audioBase64) {
+      userParts.push({
+        inlineData: {
+          mimeType: mimeType,
+          data: audioBase64
+        }
+      });
+    }
+  }
+
+  // Step 4: Handle Stickers
+  if (message.sticker) {
+    const emoji = message.sticker.emoji || '😊';
+    if (!userCaption) userCaption = `[User sent a sticker ${emoji}]`;
+  }
+
+  // Push user text/caption if present or fallback
+  if (userCaption) {
+    userParts.push({ text: userCaption });
+  } else if (userParts.length === 0) {
+    // Empty media fallback
+    userParts.push({ text: 'Hello!' });
+  }
+
+  // Step 5: Construct Chat History Context
+  let history = CHAT_HISTORIES.get(chatId) || [];
+
+  // Check if user is replying to a previous message
+  if (message.reply_to_message) {
+    const replyText = message.reply_to_message.text || message.reply_to_message.caption;
+    if (replyText) {
+      // Add context turn if history is empty
+      if (history.length === 0) {
+        history.push({ role: 'user', parts: [{ text: `[Context: Replying to previous message: "${replyText}"]` }] });
+      }
+    }
+  }
+
+  const contents = [
+    ...history,
+    {
+      role: 'user',
+      parts: userParts
+    }
+  ];
+
+  // Step 6: Call Gemini API with Multi-Model Fallback & Chat History
+  const aiResponse = await callGeminiWithFallback(contents, env.GEMINI_API_KEY, userCaption);
+
+  // Step 7: Update Local Sliding Window Chat History
+  history.push({ role: 'user', parts: userParts });
+  history.push({ role: 'model', parts: [{ text: aiResponse }] });
+  CHAT_HISTORIES.set(chatId, history.slice(-MAX_HISTORY_TURNS));
+
+  // Step 8: Send AI reply back to user via Telegram
   await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, aiResponse, businessConnectionId);
+}
+
+/**
+ * Download a file from Telegram API and convert to base64 for Gemini Multimodal API
+ */
+async function getTelegramFileBase64(token, fileId) {
+  try {
+    const fileRes = await fetch(`https://api.telegram.org/bot${token}/getFile?file_id=${fileId}`);
+    if (!fileRes.ok) return null;
+
+    const fileData = await fileRes.json();
+    const filePath = fileData.result?.file_path;
+    if (!filePath) return null;
+
+    const downloadRes = await fetch(`https://api.telegram.org/file/bot${token}/${filePath}`);
+    if (!downloadRes.ok) return null;
+
+    const arrayBuffer = await downloadRes.arrayBuffer();
+    const bytes = new Uint8Array(arrayBuffer);
+    let binary = '';
+    for (let i = 0; i < bytes.byteLength; i++) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+    return btoa(binary);
+  } catch (e) {
+    console.error('Error fetching file from Telegram:', e);
+    return null;
+  }
 }
 
 /**
  * Call Gemini API using a Multi-Model Fallback system with Automatic Retry logic
  */
-async function callGeminiWithFallback(userPrompt, apiKey) {
+async function callGeminiWithFallback(contents, apiKey, userPromptText = '') {
   if (!apiKey) {
     throw new Error('GEMINI_API_KEY environment variable is missing.');
   }
@@ -111,32 +200,29 @@ async function callGeminiWithFallback(userPrompt, apiKey) {
     `🛑 CRITICAL STRICT RULES:\n` +
     `1. NO REPETITIVE INTRODUCTIONS: NEVER say "I am an AI", "እኔ AI ነኝ", or "በ HAB IT Solutions የበለፀግኩት...". Do NOT introduce yourself or state your role unless the user explicitly asks "Who are you?".\n` +
     `2. ABSOLUTE CONCISE RESPONSES: Keep every response extremely short, clean, direct, and decorated with tasteful emojis 😊. Maximum 2-4 lines per response. No giant essays or mechanical bullet lists unless requested.\n` +
-    `3. CHAT HISTORY CONTINUITY: Always read and respect the previous conversation history. If the user replies with short words like "እሺ", "አረ", "አዎ", respond naturally in context without resetting or re-greeting.\n\n` +
-    `🎙️ MULTI-FORMAT & MEDIA UNDERSTANDING:\n` +
-    `1. VOICE & AUDIO MESSAGES: When processing voice or audio notes from users, focus on the core user intent and provide a concise, friendly text response.\n` +
-    `2. STICKERS & EMOJIS: Recognize sticker intent and inline emojis (greetings, appreciation, humor, frustration). Respond naturally with matching tone and appropriate emojis 😊.\n` +
-    `3. RICH TEXT STYLES: Correctly interpret formatting styles sent by the user (Bold, Italic, Monospace/Code, Spoilers) and adapt your output formatting cleanly.\n\n` +
+    `3. CHAT HISTORY CONTINUITY: Always read and respect the previous chat history naturally.\n\n` +
+    `🎙️ VOICE, AUDIO & IMAGE (VISION) PROCESSING:\n` +
+    `1. VOICE MESSAGES: Interpret transcripts or audio notes sent by users seamlessly. Address their core question directly without commenting on it being a voice note.\n` +
+    `2. IMAGE & MULTIMEDIA ANALYSIS: Analyze incoming images, code screenshots, or visual documents accurately and give clean, precise answers based on what you see.\n\n` +
+    `⚠️ SCREENSHOT, FORWARD & DELETE WARNING RULE:\n` +
+    `- If a user asks or mentions anything about screenshotting, forwarding, or deleting this chat/content, politely remind them:\n` +
+    `  "⚠️ *ለደህንነት ሲባል የዚህ chat መረጃዎች Forward ማድረግ ወይም Screenshot ማንሳት የተከለከሉ ናቸው። ለተጨማሪ መረጃ በ 0992480372 ያግኙን!*"\n\n` +
     `🧠 TONE & PERSONALITY (HUMAN-LIKE):\n` +
     `- Speak warmly, politely, and casually like a real professional human assistant.\n` +
     `- Match the user's language seamlessly (Amharic / አማርኛ, Afaan Oromoo, or English).\n` +
     `- Always end with a polite, natural follow-up question to keep the chat active.\n\n` +
-    `📞 OFFICIAL CONTACT & BRAND DETAILS:\n` +
-    `Only share contact information when requested or relevant:\n` +
-    `- Telegram Username: @smart_x_help (Always write with the underscore)\n` +
+    `📞 OFFICIAL CONTACT DETAILS:\n` +
+    `Only share contact details when requested or relevant:\n` +
+    `- Telegram Username: @smart_x_help\n` +
     `- Phone Number: 0992480372\n` +
     `- YouTube Channel: https://www.youtube.com/@smartx.ethiopia\n` +
     `- Project Mention: Smart x Ethiopian (Educational Platform for High School STEM, Quizzes & Short Notes).\n\n` +
     `🛑 OUTPUT FORMATTING CLEANLINESS:\n` +
     `- Output ONLY the final raw chat text meant for the user.\n` +
-    `- NEVER output debug logs, character counts, internal reasoning (e.g. "Optimization:"), or wrapping quotation marks.`;
+    `- NEVER output debug logs, character counts, internal reasoning, or quotation marks.`;
 
   const payload = {
-    contents: [
-      {
-        role: 'user',
-        parts: [{ text: userPrompt }]
-      }
-    ],
+    contents: contents,
     systemInstruction: {
       parts: [{ text: systemInstructionText }]
     },
@@ -158,7 +244,6 @@ async function callGeminiWithFallback(userPrompt, apiKey) {
       try {
         if (attempt > 0) {
           console.log(`[Gemini Retry] Retrying ${modelName} (Attempt ${attempt + 1}/${MAX_RETRIES + 1})...`);
-          // 1.5 second delay before retry
           await new Promise((resolve) => setTimeout(resolve, 1500));
         }
 
@@ -168,7 +253,6 @@ async function callGeminiWithFallback(userPrompt, apiKey) {
           body: JSON.stringify(payload)
         });
 
-        // If 503 (Server Busy) or 429 (Rate Limit) and retries remain, retry this model
         if ((response.status === 503 || response.status === 429) && attempt < MAX_RETRIES) {
           console.warn(`[Gemini ${modelName}] HTTP ${response.status}. Retrying...`);
           continue;
@@ -187,11 +271,10 @@ async function callGeminiWithFallback(userPrompt, apiKey) {
         }
 
         console.log(`[Gemini Success] Successfully generated response using model: ${modelName}`);
-        return replyText; // Success! Return response and exit function
+        return replyText;
       } catch (err) {
         console.warn(`[Gemini Attempt Failed] Model ${modelName} (Attempt ${attempt + 1}): ${err.message}`);
 
-        // If it's the last retry for this model, log error to modelErrors and break to next model
         if (attempt === MAX_RETRIES) {
           modelErrors.push(`${modelName}: ${err.message}`);
         }
@@ -199,7 +282,6 @@ async function callGeminiWithFallback(userPrompt, apiKey) {
     }
   }
 
-  // If all fallback models failed
   throw new Error(`All Gemini Fallback Models Failed:\n${modelErrors.join('\n')}`);
 }
 
@@ -299,7 +381,6 @@ async function sendAdminErrorAlert(error, env) {
     });
 
     if (!res.ok) {
-      // Fallback to plain text if Markdown formatting fails for alert
       await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
