@@ -1,0 +1,534 @@
+/**
+ * Cloudflare Worker: Telegram Business Auto-Responder Bot with Gemini API,
+ * Multi-Model Fallback, Vision/Audio Multimodal Support, Chat History Continuity,
+ * and Voice-to-Voice Response capabilities.
+ *
+ * Principal: Habtamu Yifiru / HAB IT Solutions (@smart_x_help)
+ * Target Platform: Cloudflare Workers (ES Modules format)
+ *
+ * Environment Variables / Secrets Required in Cloudflare Worker Dashboard:
+ *  - TELEGRAM_BOT_TOKEN : Bot token from @BotFather
+ *  - GEMINI_API_KEY     : Google AI Studio Gemini API Key
+ *  - ADMIN_CHAT_ID      : Admin's private Telegram User/Chat ID for error alerts
+ */
+
+// Fallback sequence of Gemini models in order of preference
+const GEMINI_MODELS = [
+  'gemini-3.6-flash',
+  'gemini-3.5-flash',
+  'gemini-3.5-flash-lite',
+  'gemini-3-flash'
+];
+
+// In-memory sliding window cache for recent conversation history per chat_id
+const CHAT_HISTORIES = new Map();
+const MAX_HISTORY_TURNS = 10; // Keep up to last 10 turns (5 user + 5 model)
+
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+
+    // 1. Webhook Setup Endpoint (/register or /setWebhook)
+    if (url.pathname === '/register' || url.pathname === '/setWebhook') {
+      return await handleSetWebhook(url.origin, env);
+    }
+
+    // 2. Incoming Telegram Update Receiver (HTTPS POST)
+    if (request.method === 'POST') {
+      try {
+        const update = await request.json();
+        await handleTelegramUpdate(update, env);
+      } catch (err) {
+        console.error('Unhandled Telegram Processing Error:', err);
+        // Dispatch alert to Admin private chat on failure
+        await sendAdminErrorAlert(err, env);
+      }
+
+      // CRITICAL: Always return HTTP 200 OK to Telegram to prevent infinite webhook retries
+      return new Response('OK', { status: 200 });
+    }
+
+    // 3. Status & Health Landing Page
+    return new Response(
+      `🤖 Telegram Business Auto-Responder Worker (Gemini Multi-Model Multimodal Voice-to-Voice)\n\n` +
+      `Status: Live & Operational\n` +
+      `Assistant Partner for: Habtamu Yifiru (@smart_x_help / HAB IT Solutions)\n` +
+      `Platform: Cloudflare Workers\n\n` +
+      `• Active Models: ${GEMINI_MODELS.join(', ')}\n` +
+      `• Capabilities: Voice-to-Voice Replies, Chat History Memory, Voice/Audio Input, Image Vision, Multi-Model Fallback\n` +
+      `• Webhook Receiver Endpoint: POST ${url.origin}/\n` +
+      `• Register Webhook Endpoint: GET ${url.origin}/register`,
+      {
+        status: 200,
+        headers: { 'Content-Type': 'text/plain; charset=utf-8' }
+      }
+    );
+  }
+};
+
+/**
+ * Main Handler for Telegram Updates (business_message or standard message)
+ */
+async function handleTelegramUpdate(update, env) {
+  const message = update.business_message || update.message;
+  if (!message) return;
+
+  const chatId = message.chat?.id;
+  const businessConnectionId = message.business_connection_id || update.business_connection_id;
+  if (!chatId) return;
+
+  const userParts = [];
+  let userCaption = message.text || message.caption || '';
+  const isVoiceInput = Boolean(message.voice || message.audio);
+
+  // Step 1: Send action status indicator to Telegram (record_voice for audio, typing for text)
+  const actionType = isVoiceInput ? 'record_voice' : 'typing';
+  await sendTelegramChatAction(env.TELEGRAM_BOT_TOKEN, chatId, actionType, businessConnectionId);
+
+  // Step 2: Handle incoming Images/Photos (Vision)
+  if (message.photo && message.photo.length > 0) {
+    const largestPhoto = message.photo[message.photo.length - 1];
+    const imageBase64 = await getTelegramFileBase64(env.TELEGRAM_BOT_TOKEN, largestPhoto.file_id);
+    if (imageBase64) {
+      userParts.push({
+        inlineData: {
+          mimeType: 'image/jpeg',
+          data: imageBase64
+        }
+      });
+    }
+  }
+
+  // Step 3: Handle incoming Voice / Audio notes
+  if (isVoiceInput) {
+    const audioObj = message.voice || message.audio;
+    const mimeType = message.voice ? 'audio/ogg' : (audioObj.mime_type || 'audio/mpeg');
+    const audioBase64 = await getTelegramFileBase64(env.TELEGRAM_BOT_TOKEN, audioObj.file_id);
+    if (audioBase64) {
+      userParts.push({
+        inlineData: {
+          mimeType: mimeType,
+          data: audioBase64
+        }
+      });
+    }
+  }
+
+  // Step 4: Handle Stickers
+  if (message.sticker) {
+    const emoji = message.sticker.emoji || '😊';
+    if (!userCaption) userCaption = `[User sent a sticker ${emoji}]`;
+  }
+
+  // Push user text/caption if present or fallback
+  if (userCaption) {
+    userParts.push({ text: userCaption });
+  } else if (userParts.length === 0) {
+    // Empty media fallback
+    userParts.push({ text: 'Hello!' });
+  }
+
+  // Step 5: Construct Chat History Context
+  let history = CHAT_HISTORIES.get(chatId) || [];
+
+  // Check if user is replying to a previous message
+  if (message.reply_to_message) {
+    const replyText = message.reply_to_message.text || message.reply_to_message.caption;
+    if (replyText) {
+      if (history.length === 0) {
+        history.push({ role: 'user', parts: [{ text: `[Context: Replying to previous message: "${replyText}"]` }] });
+      }
+    }
+  }
+
+  const contents = [
+    ...history,
+    {
+      role: 'user',
+      parts: userParts
+    }
+  ];
+
+  // Step 6: Call Gemini API with Multi-Model Fallback & Chat History (Request Audio if user sent voice)
+  const geminiResult = await callGeminiWithFallback(contents, env.GEMINI_API_KEY, isVoiceInput);
+
+  const replyText = geminiResult.replyText;
+  const replyAudio = geminiResult.replyAudio;
+
+  // Step 7: Update Local Sliding Window Chat History
+  history.push({ role: 'user', parts: userParts });
+  history.push({ role: 'model', parts: [{ text: replyText }] });
+  CHAT_HISTORIES.set(chatId, history.slice(-MAX_HISTORY_TURNS));
+
+  // Step 8: Send AI reply back to user via Telegram (Voice reply if voice input, else Text reply)
+  let sentVoiceSuccess = false;
+
+  if (isVoiceInput && replyAudio) {
+    try {
+      await sendTelegramVoice(env.TELEGRAM_BOT_TOKEN, chatId, replyAudio, replyText, businessConnectionId);
+      sentVoiceSuccess = true;
+    } catch (voiceErr) {
+      console.warn('Voice response dispatch failed. Falling back to text sending:', voiceErr);
+    }
+  }
+
+  // Fallback to text message if not sent as voice or if voice failed
+  if (!sentVoiceSuccess) {
+    await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, replyText, businessConnectionId);
+  }
+}
+
+/**
+ * Download a file from Telegram API and convert to base64 for Gemini Multimodal API
+ */
+async function getTelegramFileBase64(token, fileId) {
+  try {
+    const fileRes = await fetch(`https://api.telegram.org/bot${token}/getFile?file_id=${fileId}`);
+    if (!fileRes.ok) return null;
+
+    const fileData = await fileRes.json();
+    const filePath = fileData.result?.file_path;
+    if (!filePath) return null;
+
+    const downloadRes = await fetch(`https://api.telegram.org/file/bot${token}/${filePath}`);
+    if (!downloadRes.ok) return null;
+
+    const arrayBuffer = await downloadRes.arrayBuffer();
+    const bytes = new Uint8Array(arrayBuffer);
+    let binary = '';
+    for (let i = 0; i < bytes.byteLength; i++) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+    return btoa(binary);
+  } catch (e) {
+    console.error('Error fetching file from Telegram:', e);
+    return null;
+  }
+}
+
+/**
+ * Call Gemini API using a Multi-Model Fallback system with Automatic Retry logic.
+ * Supports requesting audio modality when user sends voice.
+ */
+async function callGeminiWithFallback(contents, apiKey, requestAudio = false) {
+  if (!apiKey) {
+    throw new Error('GEMINI_API_KEY environment variable is missing.');
+  }
+
+  const systemInstructionText =
+    `You are the elite personal assistant for Habtamu Yifiru / HAB IT Solutions. You handle customer inquiries, technical questions, and general conversations on his behalf.\n\n` +
+    `🛑 CRITICAL STRICT RULES:\n` +
+    `1. NO REPETITIVE INTRODUCTIONS: NEVER say "I am an AI", "እኔ AI ነኝ", or "በ HAB IT Solutions የበለፀግኩት...". Do NOT introduce yourself or state your role unless the user explicitly asks "Who are you?".\n` +
+    `2. ABSOLUTE CONCISE RESPONSES: Keep every response extremely short, clean, direct, and decorated with tasteful emojis 😊. Maximum 2-4 lines per response. No giant essays or mechanical bullet lists unless requested.\n` +
+    `3. CHAT HISTORY CONTINUITY: Always read and respect the previous chat history naturally.\n\n` +
+    `🎙️ VOICE, AUDIO & IMAGE (VISION) PROCESSING:\n` +
+    `1. VOICE MESSAGES: Interpret transcripts or audio notes sent by users seamlessly. When user asks by voice, provide a clear, friendly, and concise response.\n` +
+    `2. IMAGE & MULTIMEDIA ANALYSIS: Analyze incoming images, code screenshots, or visual documents accurately and give clean, precise answers based on what you see.\n\n` +
+    `⚠️ SCREENSHOT, FORWARD & DELETE WARNING RULE:\n` +
+    `- If a user asks or mentions anything about screenshotting, forwarding, or deleting this chat/content, politely remind them:\n` +
+    `  "⚠️ *ለደህንነት ሲባል የዚህ chat መረጃዎች Forward ማድረግ ወይም Screenshot ማንሳት የተከለከሉ ናቸው። ለተጨማሪ መረጃ በ 0992480372 ያግኙን!*"\n\n` +
+    `🧠 TONE & PERSONALITY (HUMAN-LIKE):\n` +
+    `- Speak warmly, politely, and casually like a real professional human assistant.\n` +
+    `- Match the user's language seamlessly (Amharic / አማርኛ, Afaan Oromoo, or English).\n` +
+    `- Always end with a polite, natural follow-up question to keep the chat active.\n\n` +
+    `📞 OFFICIAL CONTACT DETAILS:\n` +
+    `Only share contact details when requested or relevant:\n` +
+    `- Telegram Username: @smart_x_help\n` +
+    `- Phone Number: 0992480372\n` +
+    `- YouTube Channel: https://www.youtube.com/@smartx.ethiopia\n` +
+    `- Project Mention: Smart x Ethiopian (Educational Platform for High School STEM, Quizzes & Short Notes).\n\n` +
+    `🛑 OUTPUT FORMATTING CLEANLINESS:\n` +
+    `- Output ONLY the final raw chat text meant for the user.\n` +
+    `- NEVER output debug logs, character counts, internal reasoning, or quotation marks.`;
+
+  // Build generationConfig with optional audio output modality
+  const generationConfig = {
+    temperature: 0.7,
+    maxOutputTokens: 1000
+  };
+
+  if (requestAudio) {
+    generationConfig.responseModalities = ['TEXT', 'AUDIO'];
+    generationConfig.speechConfig = {
+      voiceConfig: {
+        prebuiltVoiceConfig: {
+          voiceName: 'Puck'
+        }
+      }
+    };
+  }
+
+  const payload = {
+    contents: contents,
+    systemInstruction: {
+      parts: [{ text: systemInstructionText }]
+    },
+    generationConfig: generationConfig
+  };
+
+  const modelErrors = [];
+
+  // Primary Loop: Iterate through fallback models
+  for (const modelName of GEMINI_MODELS) {
+    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`;
+    const MAX_RETRIES = 2;
+
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        if (attempt > 0) {
+          console.log(`[Gemini Retry] Retrying ${modelName} (Attempt ${attempt + 1}/${MAX_RETRIES + 1})...`);
+          await new Promise((resolve) => setTimeout(resolve, 1500));
+        }
+
+        const response = await fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+
+        if ((response.status === 503 || response.status === 429) && attempt < MAX_RETRIES) {
+          console.warn(`[Gemini ${modelName}] HTTP ${response.status}. Retrying...`);
+          continue;
+        }
+
+        if (!response.ok) {
+          const errBody = await response.text();
+          throw new Error(`HTTP ${response.status}: ${errBody}`);
+        }
+
+        const data = await response.json();
+        let replyText = '';
+        let replyAudio = null;
+
+        const parts = data.candidates?.[0]?.content?.parts || [];
+        for (const part of parts) {
+          if (part.text) {
+            replyText += part.text;
+          }
+          if (part.inlineData && part.inlineData.mimeType?.startsWith('audio/')) {
+            replyAudio = {
+              mimeType: part.inlineData.mimeType,
+              data: part.inlineData.data
+            };
+          }
+        }
+
+        if (!replyText && !replyAudio) {
+          throw new Error('Returned empty candidate content.');
+        }
+
+        console.log(`[Gemini Success] Generated response using model: ${modelName} (Audio included: ${Boolean(replyAudio)})`);
+        return { replyText: replyText || '😊', replyAudio };
+      } catch (err) {
+        console.warn(`[Gemini Attempt Failed] Model ${modelName} (Attempt ${attempt + 1}): ${err.message}`);
+
+        if (attempt === MAX_RETRIES) {
+          modelErrors.push(`${modelName}: ${err.message}`);
+        }
+      }
+    }
+  }
+
+  // Fallback: If audio modality request failed across all models, try text-only call
+  if (requestAudio) {
+    console.warn('Audio generation failed across fallback models. Retrying with text-only mode...');
+    return await callGeminiWithFallback(contents, apiKey, false);
+  }
+
+  throw new Error(`All Gemini Fallback Models Failed:\n${modelErrors.join('\n')}`);
+}
+
+/**
+ * Send Chat Action (e.g. typing or record_voice) to Telegram
+ */
+async function sendTelegramChatAction(token, chatId, action = 'typing', businessConnectionId = null) {
+  if (!token) throw new Error('TELEGRAM_BOT_TOKEN environment variable is missing.');
+
+  const body = {
+    chat_id: chatId,
+    action: action
+  };
+
+  if (businessConnectionId) {
+    body.business_connection_id = businessConnectionId;
+  }
+
+  await fetch(`https://api.telegram.org/bot${token}/sendChatAction`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+}
+
+/**
+ * Send Voice Note / Audio Message to Telegram Chat
+ */
+async function sendTelegramVoice(token, chatId, replyAudio, caption = '', businessConnectionId = null) {
+  if (!token) throw new Error('TELEGRAM_BOT_TOKEN environment variable is missing.');
+
+  // Convert Base64 string to Uint8Array
+  const binaryStr = atob(replyAudio.data);
+  const len = binaryStr.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    bytes[i] = binaryStr.charCodeAt(i);
+  }
+
+  const mimeType = replyAudio.mimeType || 'audio/ogg';
+  let filename = 'voice.ogg';
+  if (mimeType.includes('mp3') || mimeType.includes('mpeg')) filename = 'voice.mp3';
+  else if (mimeType.includes('wav')) filename = 'voice.wav';
+
+  const blob = new Blob([bytes], { type: mimeType });
+
+  const formData = new FormData();
+  formData.append('chat_id', String(chatId));
+  formData.append('voice', blob, filename);
+
+  if (caption) {
+    formData.append('caption', caption.slice(0, 1024));
+  }
+  if (businessConnectionId) {
+    formData.append('business_connection_id', businessConnectionId);
+  }
+
+  // Attempt sendVoice
+  let res = await fetch(`https://api.telegram.org/bot${token}/sendVoice`, {
+    method: 'POST',
+    body: formData
+  });
+
+  // Fallback to sendAudio if sendVoice endpoint fails
+  if (!res.ok) {
+    console.warn('sendVoice failed, trying sendAudio endpoint fallback...');
+    const formDataAudio = new FormData();
+    formDataAudio.append('chat_id', String(chatId));
+    formDataAudio.append('audio', blob, filename);
+    if (caption) formDataAudio.append('caption', caption.slice(0, 1024));
+    if (businessConnectionId) formDataAudio.append('business_connection_id', businessConnectionId);
+
+    res = await fetch(`https://api.telegram.org/bot${token}/sendAudio`, {
+      method: 'POST',
+      body: formDataAudio
+    });
+
+    if (!res.ok) {
+      const errBody = await res.text();
+      throw new Error(`Telegram sendVoice/sendAudio HTTP ${res.status}: ${errBody}`);
+    }
+  }
+}
+
+/**
+ * Send Message to Telegram Chat with Markdown support and Plain-Text fallback
+ */
+async function sendTelegramMessage(token, chatId, text, businessConnectionId = null) {
+  if (!token) throw new Error('TELEGRAM_BOT_TOKEN environment variable is missing.');
+
+  const body = {
+    chat_id: chatId,
+    text: text,
+    parse_mode: 'Markdown'
+  };
+
+  if (businessConnectionId) {
+    body.business_connection_id = businessConnectionId;
+  }
+
+  // Primary Attempt: Send with Markdown formatting
+  let res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+
+  // Fallback: If Markdown parsing fails on Telegram's side, resend as plain text
+  if (!res.ok) {
+    console.warn('Telegram Markdown parse failed. Falling back to plain text sending...');
+    delete body.parse_mode;
+
+    res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+
+    if (!res.ok) {
+      const errBody = await res.text();
+      throw new Error(`Telegram sendMessage HTTP ${res.status}: ${errBody}`);
+    }
+  }
+}
+
+/**
+ * Dispatch Private Error Alert Message to Admin (ADMIN_CHAT_ID)
+ */
+async function sendAdminErrorAlert(error, env) {
+  const adminId = env.ADMIN_CHAT_ID;
+  const token = env.TELEGRAM_BOT_TOKEN;
+
+  if (!adminId || !token) {
+    console.warn('Cannot dispatch error alert: ADMIN_CHAT_ID or TELEGRAM_BOT_TOKEN is not configured.');
+    return;
+  }
+
+  const errorDetails = error?.stack || error?.message || String(error);
+  const timestamp = new Date().toISOString();
+
+  const alertMessage =
+    `⚠️ **Telegram Bot Error Alert** ⚠️\n\n` +
+    `**Timestamp:** \`${timestamp}\`\n\n` +
+    `**Error Stack / Message:**\n` +
+    `\`\`\`\n${errorDetails.slice(0, 3000)}\n\`\`\``;
+
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: adminId,
+        text: alertMessage,
+        parse_mode: 'Markdown'
+      })
+    });
+
+    if (!res.ok) {
+      await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: adminId,
+          text: `⚠️ Telegram Bot Error Alert ⚠️\n\nTimestamp: ${timestamp}\n\nError:\n${errorDetails.slice(0, 3000)}`
+        })
+      });
+    }
+  } catch (alertErr) {
+    console.error('Failed to dispatch alert message to Admin:', alertErr);
+  }
+}
+
+/**
+ * Register Webhook Endpoint with Telegram API
+ */
+async function handleSetWebhook(originUrl, env) {
+  const token = env.TELEGRAM_BOT_TOKEN;
+  if (!token) {
+    return new Response('Error: TELEGRAM_BOT_TOKEN is missing in environment secrets.', { status: 400 });
+  }
+
+  const webhookUrl = `${originUrl}/`;
+  const res = await fetch(`https://api.telegram.org/bot${token}/setWebhook`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      url: webhookUrl,
+      allowed_updates: ['message', 'business_message']
+    })
+  });
+
+  const data = await res.json();
+  return new Response(JSON.stringify(data, null, 2), {
+    status: res.status,
+    headers: { 'Content-Type': 'application/json' }
+  });
+}
